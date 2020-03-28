@@ -17,6 +17,9 @@
 #define PROCFS_FILE		"tracer"
 #define TRACER_HASH_BITS	10
 
+#define MEM_INFO_COUNT		10
+#define ADDR_SIZE		8
+
 #define TRACER_ADD_PROCESS	_IOW(_IOC_WRITE, 42, pid_t)
 #define TRACER_REMOVE_PROCESS	_IOW(_IOC_WRITE, 43, pid_t)
 
