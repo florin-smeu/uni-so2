@@ -17,94 +17,127 @@
 #include <linux/miscdevice.h>
 #include <linux/hashtable.h>
 #include <linux/kprobes.h>
+#include <linux/atomic.h>
+
 #include "tracer.h"
 
+DEFINE_HASHTABLE(tr_hashtable, TRACER_HASH_BITS);
+DEFINE_HASHTABLE(mem_hashtable, MEM_HASH_BITS);
 
-/*****************************************************************
- * Hashtable info
+DEFINE_SPINLOCK(tracer_spinlock);
+DEFINE_SPINLOCK(mem_spinlock);
+
+/*
+ * Structure that holds information about a tracer record. The information is
+ * stored per process.
  */
-struct mem_info {
-	int pid;
+struct tr_record {
+	pid_t pid;
 
-	unsigned long addr;
-	unsigned long size;
+	/* Accounting fields */
+	atomic_t alloc_count;
+	atomic_t free_count;
+	atomic64_t alloc_mem;
+	atomic64_t free_mem;
+	atomic_t sched_count;
+	atomic_t up_count;
+	atomic_t down_count;
+	atomic_t lock_count;
+	atomic_t unlock_count;
 
 	struct hlist_node next;
 };
 
 /*
- * instrumentation record structure
+ * Structure that holds information about the memory allocation. Useful when
+ * a traced process performs memory operations, because it links the size and
+ * the address of the memory allocated/freed.
  */
-struct instr_rec {
-	int pid;
-	int alloc;
-	int free;
-	unsigned long alloc_mem;
-	unsigned long free_mem;
-	int sched;
-	int up;
-	int down;
-	int lock;
-	int unlock;
+struct mem_record {
+	pid_t pid;
 
-	spinlock_t s_lock;
+	/* Size of the memory allocated */
+	atomic64_t size;
+	/* Address of the memory allocated */
+	atomic64_t addr;
+
 	struct hlist_node next;
 };
 
-DEFINE_HASHTABLE(tr_hashtable, TRACER_HASH_BITS);
-DEFINE_HASHTABLE(mi_hashtable, TRACER_HASH_BITS);
+/*
+ * init_tracer_record - initialize the fields of a tracer record structure
+ * @tr_info: &struct tr_record to be initialized
+ * @pid: the pid to be used in initialization
+ */
+static void init_tracer_record(struct tr_record *tr_info, pid_t pid)
+{
+	tr_info->pid = pid;
+	atomic_set(&tr_info->alloc_count, 0);
+	atomic_set(&tr_info->free_count, 0);
+	atomic64_set(&tr_info->alloc_mem, 0);
+	atomic64_set(&tr_info->free_mem, 0);
+	atomic_set(&tr_info->sched_count, 0);
+	atomic_set(&tr_info->up_count, 0);
+	atomic_set(&tr_info->down_count, 0);
+	atomic_set(&tr_info->lock_count, 0);
+	atomic_set(&tr_info->unlock_count, 0);
+}
 
+/*
+ * delete_hashtable - deallocate memory occupied by a hashtable
+ * @type: char representing the type of the hashtable
+ */
 static void delete_hashtable(char type)
 {
-	struct instr_rec *data;
-	struct mem_info *mi_record;
-	
+	struct tr_record *tr_info;
+	struct mem_record *mem_info;
 	struct hlist_node *tmp;
 	int bkt;
-	
-	if (type == 't') {
-		hash_for_each_safe(tr_hashtable, bkt, tmp, data, next) {
-			hash_del(&data->next);
-			kfree(data);
+
+	if (type == TRACER_HASH_ID) {
+		hash_for_each_safe(tr_hashtable, bkt, tmp, tr_info, next) {
+			spin_lock(&tracer_spinlock);
+			hash_del(&tr_info->next);
+			kfree(tr_info);
+			spin_unlock(&tracer_spinlock);
 		}
-	} else if (type == 'm') {
-		hash_for_each_safe(mi_hashtable, bkt, tmp, mi_record, next) {
-			hash_del(&mi_record->next);
-			kfree(mi_record);
+	} else if (type == MEM_HASH_ID) {
+		hash_for_each_safe(mem_hashtable, bkt, tmp, mem_info, next) {
+			spin_lock(&mem_spinlock);
+			hash_del(&mem_info->next);
+			kfree(mem_info);
+			spin_unlock(&mem_spinlock);
 		}
 	}
 }
 
-
-/*****************************************************************
- * Procfs file info
+/**************************************************************
+ * Procfs file data and operations
  */
+
 struct proc_dir_entry *proc_tracer;
 
-/*
- * tracer_proc_show - Print the tracer information
- */
 static int tracer_proc_show(struct seq_file *m, void *v)
 {
 	int bkt;
-	struct instr_rec *crt;
+	struct tr_record *tr_info;
 
-	seq_puts(m, "PID\tkmalloc\tkfree\tkmalloc_mem\tkfree_mem\tsched\tup"
-			"\tdown\tlock\tunlock\n");
+	seq_puts(m, "PID\tkmalloc\tkfree\tkmalloc_mem\tkfree_mem\tsched\tup\tdown\tlock\tunlock\n");
 
-	hash_for_each(tr_hashtable, bkt, crt, next) {
-		seq_printf(m, "%d\t%d\t%d\t\t%ld\t\t%ld\t%d\t%d\t%d\t%d\t%d\n", 
-				crt->pid,
-				crt->alloc, 
-				crt->free,
-				crt->alloc_mem,
-				crt->free_mem,
-				crt->sched,
-				crt->up,
-				crt->down,
-				crt->lock,
-				crt->unlock);
+	hash_for_each(tr_hashtable, bkt, tr_info, next) {
+		seq_printf(m, "%d\t%d\t%d\t%lld\t%lld\t%d\t%d\t%d\t%d\t%d\n",
+			   tr_info->pid,
+			   atomic_read(&tr_info->alloc_count),
+			   atomic_read(&tr_info->free_count),
+			   atomic64_read(&tr_info->alloc_mem),
+			   atomic64_read(&tr_info->free_mem),
+			   atomic_read(&tr_info->sched_count),
+			   atomic_read(&tr_info->up_count),
+			   atomic_read(&tr_info->down_count),
+			   atomic_read(&tr_info->lock_count),
+			   atomic_read(&tr_info->unlock_count));
 	}
+
 	return 0;
 }
 
@@ -120,319 +153,293 @@ static const struct file_operations tracer_fops = {
 	.release	= single_release,
 };
 
-
-/*****************************************************************
+/**************************************************************
  * Char device data and operations
  */
-static int tracer_cdev_open(struct inode *inode, struct file *file)
-{
-	pr_info("Device open\n");
-	return 0;
-}
-
-static int tracer_cdev_release(struct inode *inode, struct file *file)
-{
-	pr_info("Device release\n");
-	return 0;
-}
-
-static ssize_t tracer_cdev_read(struct file *file,
-					char __user *user_buffer,
-					size_t size, loff_t *offset)
-{
-	pr_info("Device read\n");
-	return 0;
-}
-
-static ssize_t tracer_cdev_write(struct file *file,
-					const char __user *user_buffer,
-					size_t size, loff_t *offset)
-{
-	pr_info("Device write\n");
-	return 0;
-}
-
-static void init_instrumentation_record(struct instr_rec *data, int pid)
-{
-	data->pid = pid;
-	data->alloc = 0;
-	data->free = 0;
-	data->alloc_mem = 0;
-	data->free_mem = 0;
-	data->sched = 0;
-	data->up = 0;
-	data->down = 0;
-	data->lock = 0;
-	data->unlock = 0;
-
-	spin_lock_init(&data->s_lock);
-}
-
 
 static long tracer_cdev_ioctl(struct file *file, unsigned int cmd,
-				unsigned long arg)
+			      unsigned long arg)
 {
-	struct instr_rec *data;
+	struct tr_record *tr_info;
+	struct mem_record *mem_info;
 	struct hlist_node *tmp;
-	
-	pr_info("Device ioctl\n");
+
+	pid_t pid = arg;
 
 	switch (cmd) {
 	case TRACER_ADD_PROCESS:
-		pr_info("Add process %ld\n", arg);
-		data = kmalloc(sizeof(struct instr_rec), GFP_ATOMIC);
-		if (!data) {
-			pr_err("Failed to allocate memory!\n");
+		/*
+		 * Add a process to the tr_hashtable.
+		 */
+		tr_info = kmalloc(sizeof(struct tr_record), GFP_ATOMIC);
+		if (!tr_info)
 			return -ENOMEM;
-		}
 
-		init_instrumentation_record(data, arg);
-		hash_add(tr_hashtable, &data->next, data->pid);
+		init_tracer_record(tr_info, pid);
+
+		spin_lock(&tracer_spinlock);
+		hash_add(tr_hashtable, &tr_info->next, tr_info->pid);
+		spin_unlock(&tracer_spinlock);
 		break;
 	case TRACER_REMOVE_PROCESS:
-		pr_info("Remove process %ld\n", arg);
-		
-		hash_for_each_possible_safe(tr_hashtable, data, tmp, next, arg) {
-			if (arg == data->pid) {
-				hash_del(&data->next);
-				kfree(data);
+		/*
+		 * Remove a process from the tr_hashtable. Also, make sure to
+		 * free the memory occupied by the mem_hashtable.
+		 */
+		hash_for_each_possible_safe(tr_hashtable, tr_info, tmp,
+					    next, pid) {
+			if (pid == tr_info->pid) {
+				spin_lock(&tracer_spinlock);
+				hash_del(&tr_info->next);
+				kfree(tr_info);
+				spin_unlock(&tracer_spinlock);
 			}
 		}
-		break;
+
+		hash_for_each_possible_safe(mem_hashtable, mem_info, tmp,
+					    next, pid) {
+			if (pid == mem_info->pid) {
+				spin_lock(&mem_spinlock);
+				hash_del(&mem_info->next);
+				kfree(mem_info);
+				spin_unlock(&mem_spinlock);
+			}
+		}
 	}
+
 	return 0;
 }
 
-static const struct file_operations dev_fops = {                                
-        .owner		= THIS_MODULE,                                                   
-        .open		= tracer_cdev_open,                                                  
-        .release 	= tracer_cdev_release,                                            
-        .read 		= tracer_cdev_read,                                                  
-        .write 		= tracer_cdev_write,                                                
-        .unlocked_ioctl = tracer_cdev_ioctl                                        
-}; 
+static const struct file_operations dev_fops = {
+	.owner		= THIS_MODULE,
+	.unlocked_ioctl = tracer_cdev_ioctl,
+};
 
-static struct miscdevice tracer_dev = {	
+static struct miscdevice tracer_dev = {
 	.minor = TRACER_DEV_MINOR,
 	.name = TRACER_DEV_NAME,
 	.fops = &dev_fops,
 };
 
-/*****************************************************************
- * Kretprobes data
+/**************************************************************
+ * Kprobes handlers and variables
  */
 
 static int alloc_probe_entry_handler(struct kretprobe_instance *ri,
-					struct pt_regs *regs)
+				     struct pt_regs *regs)
 {
-	struct instr_rec *data;
-	int pid;
+	struct tr_record *tr_info;
+	pid_t pid;
+	unsigned long *size;
 
 	pid = current->pid;
-	
-	hash_for_each_possible(tr_hashtable, data, next, pid) {
-		if (pid == data->pid) {
-			spin_lock(&data->s_lock);
-			data->alloc++;
-			spin_unlock(&data->s_lock);
+
+	/*
+	 * Store the size of the memory allocated in the current
+	 * kretprobe instance data field.
+	 */
+	size = (unsigned long *)ri->data;
+	*size = regs->ax;
+
+	hash_for_each_possible(tr_hashtable, tr_info, next, pid) {
+		if (pid == tr_info->pid) {
+			atomic_inc(&tr_info->alloc_count);
+			atomic64_add(*size, &tr_info->alloc_mem);
 		}
 	}
-	
-	/* Save the size of the memory allocated in the kretprobe_instance */
-	memcpy(&ri->data, &regs->ax, sizeof(unsigned long));
 
 	return 0;
 }
 
-
-static int alloc_probe_handler(struct kretprobe_instance *ri,
-				struct pt_regs *regs)
+static int alloc_probe_return_handler(struct kretprobe_instance *ri,
+				      struct pt_regs *regs)
 {
-        struct instr_rec *data;
-	struct mem_info *mi_record;
-	int pid;
+	struct mem_record *mem_info;
+	pid_t pid;
+	unsigned long *size;
+	unsigned long retval;
 
+	/*
+	 * Retrieve the size of the memory allocated from the data field of
+	 * the current kretprobe instance.
+	 */
 	pid = current->pid;
+	size = (unsigned long *)ri->data;
 
-	/* Add mem_info record in the hashtable */
-	mi_record = kmalloc(sizeof(struct mem_info), GFP_ATOMIC);
-	if (!mi_record)
+	/*
+	 * Retrieve the address of the memory allocation.
+	 */
+	retval = regs_return_value(regs);
+
+	mem_info = kmalloc(sizeof(struct mem_record), GFP_ATOMIC);
+	if (!mem_info)
 		return -ENOMEM;
 
-	mi_record->pid = pid;
-	mi_record->addr = (unsigned long)ri->ret_addr;
-	mi_record->size = (unsigned long)ri->data;
-	hash_add(mi_hashtable, &mi_record->next, mi_record->pid);
-	
-	hash_for_each_possible(tr_hashtable, data, next, pid) {
-		if (pid == data->pid) {
-			spin_lock(&data->s_lock);
-			data->alloc_mem += mi_record->size;
-			spin_unlock(&data->s_lock);
-		}
-	}
-	
-        return 0; 
+	mem_info->pid = pid;
+	atomic64_set(&mem_info->size, *size);
+	atomic64_set(&mem_info->addr, retval);
+
+	spin_lock(&mem_spinlock);
+	hash_add(mem_hashtable, &mem_info->next, mem_info->pid);
+	spin_unlock(&mem_spinlock);
+
+	return 0;
 }
 
-static int free_probe_handler(struct kprobe *p, struct pt_regs *regs)
+static int kfree_probe_handler(struct kprobe *p, struct pt_regs *regs)
 {
-        struct instr_rec *data;
-	struct mem_info *mi_record;
-	int pid;
+	struct tr_record *tr_info;
+	struct mem_record *mem_info;
+	pid_t pid;
 	unsigned long addr;
-	unsigned long size;
+	unsigned long size = 0;
 
 	pid = current->pid;
 	addr = regs->ax;
 
-	size = 0;
-	hash_for_each_possible(mi_hashtable, mi_record, next, pid) {
-		if (pid == mi_record->pid && addr == mi_record->addr)
-			size = mi_record->size;
-	}
-
-	if (!size)
-		return -1;
-
-	hash_for_each_possible(tr_hashtable, data, next, pid) {
-		if (pid == data->pid) {
-			spin_lock(&data->s_lock);
-			data->free++;
-			data->free_mem += size;
-			spin_unlock(&data->s_lock);
+	/*
+	 * Retrieve the size of the memory allocated by inspecting the
+	 * mem_hashtable.
+	 */
+	hash_for_each_possible(mem_hashtable, mem_info, next, pid) {
+		if (pid == mem_info->pid) {
+			if (addr == atomic64_read(&mem_info->addr)) {
+				size = atomic64_read(&mem_info->size);
+				break;
+			}
 		}
 	}
-        return 0; 
-}
 
+	hash_for_each_possible(tr_hashtable, tr_info, next, pid) {
+		if (pid == tr_info->pid) {
+			atomic_inc(&tr_info->free_count);
+			atomic64_add(size, &tr_info->free_mem);
+		}
+	}
+
+	return 0;
+}
 
 static int sched_probe_handler(struct kprobe *p, struct pt_regs *regs)
 {
-	struct instr_rec *data;
-	int pid;
+	struct tr_record *tr_info;
+	pid_t pid;
 
 	pid = current->pid;
-		
-	hash_for_each_possible(tr_hashtable, data, next, pid) {
-		if (pid == data->pid) {
-			spin_lock(&data->s_lock);
-			data->sched++;
-			spin_unlock(&data->s_lock);
-		}
+
+	hash_for_each_possible(tr_hashtable, tr_info, next, pid) {
+		if (pid == tr_info->pid)
+			atomic_inc(&tr_info->sched_count);
 	}
-        return 0; 
+
+	return 0;
 }
 
 static int up_probe_handler(struct kprobe *p, struct pt_regs *regs)
 {
-	struct instr_rec *data;
-	int pid;
+	struct tr_record *tr_info;
+	pid_t pid;
 
 	pid = current->pid;
-	
-	hash_for_each_possible(tr_hashtable, data, next, pid) {
-		if (pid == data->pid) {
-			spin_lock(&data->s_lock);
-			data->up++;
-			spin_unlock(&data->s_lock);
-		}
+
+	hash_for_each_possible(tr_hashtable, tr_info, next, pid) {
+		if (pid == tr_info->pid)
+			atomic_inc(&tr_info->up_count);
 	}
-        return 0; 
+
+	return 0;
 }
 
 static int down_probe_handler(struct kprobe *p, struct pt_regs *regs)
 {
-        struct instr_rec *data;
-	int pid;
+	struct tr_record *tr_info;
+	pid_t pid;
 
 	pid = current->pid;
 
-	hash_for_each_possible(tr_hashtable, data, next, pid) {
-		if (pid == data->pid) {
-			spin_lock(&data->s_lock);
-			data->down++;
-			spin_unlock(&data->s_lock);
-		}
+	hash_for_each_possible(tr_hashtable, tr_info, next, pid) {
+		if (pid == tr_info->pid)
+			atomic_inc(&tr_info->down_count);
 	}
 
-        return 0; 
+	return 0;
 }
 
 static int lock_probe_handler(struct kprobe *p, struct pt_regs *regs)
-{	
-	struct instr_rec *data;
-	int pid;
+{
+	struct tr_record *tr_info;
+	pid_t pid;
 
 	pid = current->pid;
 
-	hash_for_each_possible(tr_hashtable, data, next, pid) {
-		if (pid == data->pid) {
-			spin_lock(&data->s_lock);
-			data->lock++;
-			spin_unlock(&data->s_lock);
-		}
+	hash_for_each_possible(tr_hashtable, tr_info, next, pid) {
+		if (pid == tr_info->pid)
+			atomic_inc(&tr_info->lock_count);
 	}
-        return 0; 
+
+	return 0;
 }
 
 static int unlock_probe_handler(struct kprobe *p, struct pt_regs *regs)
 {
-	struct instr_rec *data;
-	int pid;
+	struct tr_record *tr_info;
+	pid_t pid;
 
 	pid = current->pid;
 
-
-	hash_for_each_possible(tr_hashtable, data, next, pid) {
-		if (pid == data->pid) {
-			spin_lock(&data->s_lock);
-			data->unlock++;
-			spin_unlock(&data->s_lock);
-		}	
+	hash_for_each_possible(tr_hashtable, tr_info, next, pid) {
+		if (pid == tr_info->pid)
+			atomic_inc(&tr_info->unlock_count);
 	}
-        return 0; 
+
+	return 0;
 }
 
 static int exit_probe_handler(struct kprobe *p, struct pt_regs *regs)
 {
-	struct instr_rec *data;
-	struct mem_info *mi_data;
+	struct tr_record *tr_info;
+	struct mem_record *mem_info;
 	struct hlist_node *tmp;
-	int pid;
+	pid_t pid;
 
 	pid = current->pid;
 
-	/* TODO Might not be ok to use kfree here */
-
-	hash_for_each_possible_safe(tr_hashtable, data, tmp, next, pid) {
-		if (pid == data->pid) {
-			hash_del(&data->next);
-			kfree(data);
+	/*
+	 * Delete hash entries and deallocate memory when a process finishes
+	 * execution. This is signaled by the do_exit() call.
+	 */
+	hash_for_each_possible_safe(tr_hashtable, tr_info, tmp, next, pid) {
+		if (pid == tr_info->pid) {
+			spin_lock(&tracer_spinlock);
+			hash_del(&tr_info->next);
+			kfree(tr_info);
+			spin_unlock(&tracer_spinlock);
 		}
 	}
 
-	hash_for_each_possible_safe(mi_hashtable, mi_data, tmp, next, pid) {
-		if (pid == mi_data->pid) {
-			hash_del(&mi_data->next);
-			kfree(mi_data);
+	hash_for_each_possible_safe(mem_hashtable, mem_info, tmp, next, pid) {
+		if (pid == mem_info->pid) {
+			spin_lock(&mem_spinlock);
+			hash_del(&mem_info->next);
+			kfree(mem_info);
+			spin_unlock(&mem_spinlock);
 		}
 	}
-	
+
 	return 0;
 }
 
 static struct kretprobe alloc_probe = {
-       	.kp.symbol_name = "__kmalloc",
+	.kp.symbol_name = "__kmalloc",
 	.entry_handler = alloc_probe_entry_handler,
-	.handler = alloc_probe_handler,
+	.handler = alloc_probe_return_handler,
 	.maxactive = 32,
 	.data_size = sizeof(unsigned long),
 };
 
-static struct kprobe free_probe = {
+static struct kprobe kfree_probe = {
 	.symbol_name = "kfree",
-	.pre_handler = free_probe_handler,
+	.pre_handler = kfree_probe_handler,
 };
 
 static struct kprobe sched_probe = {
@@ -446,7 +453,7 @@ static struct kprobe up_probe = {
 };
 
 static struct kprobe down_probe = {
-  	.symbol_name = "down_interruptible",
+	.symbol_name = "down_interruptible",
 	.pre_handler = down_probe_handler,
 };
 
@@ -465,99 +472,102 @@ static struct kprobe exit_probe = {
 	.pre_handler = exit_probe_handler,
 };
 
-static int register_kretprobe_helper(struct kretprobe *krp)
-{	
-	int ret;
-
-        ret = register_kretprobe(krp);                                
-        if (ret < 0) {                                                          
-                pr_err("register_kretprobe failed, returned %d\n", ret);        
-                return -1;                                                      
-        }                                                                       
-        pr_info("Planted return probe at %s: %px\n", 
-			krp->kp.symbol_name, krp->kp.addr);   
-
-	return 0;
-}
-
-static void unregister_kretprobe_helper(struct kretprobe *krp)
-{
-	unregister_kretprobe(krp);                                    
-        pr_info("kretprobe at %p unregistered\n", krp->kp.addr);        
-}
-
-static int register_kprobe_helper(struct kprobe *kp)
-{
-	int ret;
-
-        ret = register_kprobe(kp);                                
-        if (ret < 0) {                                                          
-                pr_err("register_kprobe failed, returned %d\n", ret);        
-                return -1;                                                      
-        }                                                                       
-        pr_info("Planted probe at %s: %px\n", 
-			kp->symbol_name, kp->addr);   
-
-	return 0;
-}
-
-static void unregister_kprobe_helper(struct kprobe *kp)
-{
-	unregister_kprobe(kp);                                    
-        pr_info("kprobe at %p unregistered\n", kp->addr);        
-}
-
-/*****************************************************************
- * Module init and exit
+/**************************************************************
+ * Module init and exit functions
  */
+
 static int tracer_init(void)
 {
 	int ret;
-	
+
+	hash_init(tr_hashtable);
+	hash_init(mem_hashtable);
+
+	spin_lock_init(&tracer_spinlock);
+	spin_lock_init(&mem_spinlock);
+
 	proc_tracer = proc_create(PROCFS_FILE, 0000, NULL, &tracer_fops);
 	if (!proc_tracer)
 		return -ENOMEM;
-	
+
 	ret = misc_register(&tracer_dev);
 	if (ret)
-		return ret;
-	pr_info("tracer: got minor %i\n", tracer_dev.minor);
+		goto remove_procfs_entry;
 
-	
-#if 0	
-#endif
-	//register_kretprobe_helper(&alloc_probe);
-	//register_kprobe_helper(&free_probe);
-	register_kprobe_helper(&exit_probe);
-	register_kprobe_helper(&sched_probe);
-	register_kprobe_helper(&up_probe);
-	register_kprobe_helper(&down_probe);
-	register_kprobe_helper(&lock_probe);
-	register_kprobe_helper(&unlock_probe);
-	
+	ret = register_kretprobe(&alloc_probe);
+	if (ret)
+		goto deregister_miscdevice;
+
+	ret = register_kprobe(&kfree_probe);
+	if (ret)
+		goto unregister_alloc_probe;
+
+	ret = register_kprobe(&exit_probe);
+	if (ret)
+		goto unregister_kfree_probe;
+
+	ret = register_kprobe(&sched_probe);
+	if (ret)
+		goto unregister_exit_probe;
+
+	ret = register_kprobe(&up_probe);
+	if (ret)
+		goto unregister_sched_probe;
+
+	ret = register_kprobe(&down_probe);
+	if (ret)
+		goto unregister_up_probe;
+
+	ret = register_kprobe(&lock_probe);
+	if (ret)
+		goto unregister_down_probe;
+
+	ret = register_kprobe(&unlock_probe);
+	if (ret)
+		goto unregister_lock_probe;
+
 	return 0;
+
+unregister_lock_probe:
+	unregister_kprobe(&lock_probe);
+unregister_down_probe:
+	unregister_kprobe(&down_probe);
+unregister_up_probe:
+	unregister_kprobe(&up_probe);
+unregister_sched_probe:
+	unregister_kprobe(&sched_probe);
+unregister_exit_probe:
+	unregister_kprobe(&exit_probe);
+unregister_kfree_probe:
+	unregister_kprobe(&kfree_probe);
+unregister_alloc_probe:
+	unregister_kretprobe(&alloc_probe);
+
+deregister_miscdevice:
+	misc_deregister(&tracer_dev);
+
+remove_procfs_entry:
+	proc_remove(proc_tracer);
+
+	return -1;
 }
 
 static void tracer_exit(void)
 {
-#if 0	
-#endif
-	//unregister_kretprobe_helper(&alloc_probe);
-	//unregister_kprobe_helper(&free_probe);
-	unregister_kprobe_helper(&exit_probe);
-	unregister_kprobe_helper(&sched_probe);
-	unregister_kprobe_helper(&up_probe);
-	unregister_kprobe_helper(&down_probe);
-	unregister_kprobe_helper(&lock_probe);
-	unregister_kprobe_helper(&unlock_probe);
-	
-#if 0
-#endif
+	unregister_kretprobe(&alloc_probe);
+	unregister_kprobe(&kfree_probe);
+	unregister_kprobe(&exit_probe);
+	unregister_kprobe(&sched_probe);
+	unregister_kprobe(&up_probe);
+	unregister_kprobe(&down_probe);
+	unregister_kprobe(&lock_probe);
+	unregister_kprobe(&unlock_probe);
+
 	misc_deregister(&tracer_dev);
 	proc_remove(proc_tracer);
-	
-	delete_hashtable('t');
-	delete_hashtable('m');
+
+	delete_hashtable(TRACER_HASH_ID);
+	delete_hashtable(MEM_HASH_ID);
 }
 
 module_init(tracer_init);
