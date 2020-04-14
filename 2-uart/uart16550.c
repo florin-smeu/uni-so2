@@ -72,32 +72,32 @@ irqreturn_t uart_interrupt_handler(int irq_no, void *dev_id)
 		return IRQ_NONE;
 	
 	if ((iir & INTR_ID_MASK) == RDAI_ID) {
-		spin_lock(&dev->lock);
 		c = inb(reg + RBR_OFFSET);
+		
+		spin_lock(&dev->lock);
 		kfifo_in(&dev->read_buf, &c, 1);
-
+		spin_unlock(&dev->lock);
+		
 		if (kfifo_is_full(&dev->read_buf)) {
 			/* Clear RDAI bit in Interrupt Enable Register */
 			rdai_mask = RDAI_MASK;
 			ier &= (~rdai_mask);
 			outb(ier, reg + IER_OFFSET);
 		}
-		spin_unlock(&dev->lock);
 	
 		wake_up_interruptible(&dev->wq_reads);
 	} else if ((iir & INTR_ID_MASK) == THREI_ID) {
-		spin_lock(&dev->lock);
 		
 		while (!kfifo_is_empty(&dev->write_buf)) {
+			spin_lock(&dev->lock);
 			kfifo_out(&dev->write_buf, &c, 1);
+			spin_unlock(&dev->lock);
 			outb(c, reg + THR_OFFSET);
 		}
 		/* Clear THREI bit in Interrupt Enable Register */
 		threi_mask = THREI_MASK;
 		ier &= (~threi_mask);
 		outb(ier, reg + IER_OFFSET);
-
-		spin_unlock(&dev->lock);
 
 		wake_up_interruptible(&dev->wq_writes);
 	} else {
@@ -131,7 +131,7 @@ static int uart_release(struct inode *inode, struct file *file)
 static ssize_t uart_read(struct file *file, char __user *user_buffer,
 			 size_t size, loff_t *offset)
 {
-	int i = 0;
+	int len = 0;
 	unsigned int cp;
 	int reg;
 	unsigned char ier;
@@ -139,23 +139,21 @@ static ssize_t uart_read(struct file *file, char __user *user_buffer,
 	unsigned long flags;
 	unsigned char tmp[size];
 	struct uart_dev *dev = (struct uart_dev *) file->private_data;
- 
-	if (file->f_mode & O_NONBLOCK) {
-		if (kfifo_is_empty(&dev->read_buf))
-			return -EAGAIN;
-	} else {
+
+	if (kfifo_is_empty(&dev->read_buf)) {
 		if (wait_event_interruptible(dev->wq_reads,
 					     !kfifo_is_empty(&dev->read_buf)))
 			return -ERESTARTSYS;
 	}
 
+	pr_info("WAAAIT\n");
 	spin_lock_irqsave(&dev->lock, flags);
 	
-	while (size) {
+	while (1) {
 		if (!kfifo_is_empty(&dev->read_buf)) {
-			kfifo_out(&dev->read_buf, &tmp[i], 1);	
-			i++;
-			size--;
+			len = kfifo_len(&dev->read_buf);
+			kfifo_out(&dev->read_buf, tmp, len);	
+			break;
 		}
 	}
 	
@@ -174,8 +172,8 @@ static ssize_t uart_read(struct file *file, char __user *user_buffer,
 
 	spin_unlock_irqrestore(&dev->lock, flags);
 	
-	copy_to_user(user_buffer, &tmp, size);
-	return i;
+	copy_to_user(user_buffer, &tmp, len);
+	return len;
 }
 
 static ssize_t uart_write(struct file *file, const char __user *user_buffer,
